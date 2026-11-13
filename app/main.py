@@ -10,11 +10,18 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .repository import (
+    COLLECTION_DEFAULT_PAGE_SIZE,
+    COLLECTION_MAX_PAGE_SIZE,
+    COLLECTION_MIN_PAGE_SIZE,
     DomainError,
+    create_collection_batch,
     get_article_info,
+    get_collection_batch,
+    get_collection_page,
     get_page_info,
     health_counts,
     initialize_database,
+    list_collection_batches,
     search_phrase,
     seed_demo_if_empty,
     upsert_catalog_article,
@@ -22,6 +29,9 @@ from .repository import (
 )
 from .schemas import (
     ArticleInfo,
+    BatchInfo,
+    BatchListResponse,
+    BatchPageResponse,
     CatalogArticleInput,
     HealthResponse,
     OCRPageInput,
@@ -60,6 +70,17 @@ Phrase search over OCR tokens, with per-word page and image-box locations.
 单版 OCR 重传会在一个 SQLite `BEGIN IMMEDIATE` 事务中替换该版 OCR，并只重建
 引用该版面的文章索引。搜索使用同一读快照，因此并发查询只会看到更正前或更正后的
 完整结果，不会看到半重建状态。
+
+### 全文库采集（首次全量，之后只采更正）
+
+1. `POST /api/collection/batches?mode=full&page_size=1` 开全量批号，逐页
+   `GET /api/collection/batches/{batch_id}/pages/{page}` 取回 OCR 齐全文章的
+   编号、标题和带字框的有序词；批号内容在创建时固化，中途更正不改变任何一页。
+2. 采到一半时照常 `PUT /api/pages/page-002/ocr` 提交更正，OCR、编目、检索不受影响。
+3. 取完全量末页拿到不透明 `continuation`，再
+   `POST /api/collection/batches?mode=incremental&continuation=...` 开增量批号：
+   只返回该位置之后的提交，一次提交涉及的文章同组、不拆页，内容以那次提交为准。
+   凭 `batch_id` 重取或重启后续采结果不变。
 """
 
 
@@ -101,6 +122,13 @@ def create_app(
             {"name": "pages", "description": "OCR page ingestion and inspection"},
             {"name": "catalog", "description": "Article block order from cataloging"},
             {"name": "search", "description": "Case-insensitive OCR phrase search"},
+            {
+                "name": "collection",
+                "description": (
+                    "Immutable full-load and incremental collection rounds for the "
+                    "unified full-text warehouse"
+                ),
+            },
             {"name": "ops", "description": "Health and documentation"},
         ],
     )
@@ -219,6 +247,79 @@ def create_app(
         ),
     ) -> dict:
         return search_phrase(db_path, q, article_id=article_id, limit=limit)
+
+    # ------------------------------------------------------------------
+    # Collection API: first full load, then corrections only
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/api/collection/batches",
+        response_model=BatchInfo,
+        tags=["collection"],
+        status_code=201,
+        summary="Open an immutable full-load or incremental collection batch",
+    )
+    def post_collection_batch(
+        mode: str = Query(
+            ...,
+            pattern="^(full|incremental)$",
+            description=(
+                "full = first load of every OCR-complete article; "
+                "incremental = only corrections committed after continuation"
+            ),
+        ),
+        page_size: int = Query(
+            default=COLLECTION_DEFAULT_PAGE_SIZE,
+            ge=COLLECTION_MIN_PAGE_SIZE,
+            le=COLLECTION_MAX_PAGE_SIZE,
+            description=(
+                "Maximum number of groups per page. A group is the set of "
+                "articles one commit touched; it is never split across pages."
+            ),
+        ),
+        continuation: str | None = Query(
+            default=None,
+            description=(
+                "Opaque token from the final page of a previous batch. "
+                "Required for mode=incremental; forbidden for mode=full."
+            ),
+        ),
+    ) -> dict:
+        return create_collection_batch(
+            db_path, mode, page_size=page_size, continuation=continuation
+        )
+
+    @app.get(
+        "/api/collection/batches",
+        response_model=BatchListResponse,
+        tags=["collection"],
+        summary="List collection batches (newest first), for restart recovery",
+    )
+    def get_collection_batches(
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> dict:
+        return list_collection_batches(db_path, limit=limit)
+
+    @app.get(
+        "/api/collection/batches/{batch_id}",
+        response_model=BatchInfo,
+        tags=["collection"],
+        summary="Inspect one batch and its continuation token",
+    )
+    def get_collection_batch_info(batch_id: str = ApiPath(..., min_length=8)) -> dict:
+        return get_collection_batch(db_path, batch_id)
+
+    @app.get(
+        "/api/collection/batches/{batch_id}/pages/{page}",
+        response_model=BatchPageResponse,
+        tags=["collection"],
+        summary="Fetch one immutable page of a batch, by batch id and page number",
+    )
+    def get_collection_batch_page(
+        batch_id: str = ApiPath(..., min_length=8),
+        page: int = ApiPath(..., ge=1),
+    ) -> dict:
+        return get_collection_page(db_path, batch_id, page)
 
     return app
 

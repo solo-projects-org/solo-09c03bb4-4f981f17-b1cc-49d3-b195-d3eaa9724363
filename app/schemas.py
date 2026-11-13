@@ -284,3 +284,88 @@ class HealthResponse(BaseModel):
     articles: int
     ocr_words: int
     indexed_words: int
+    collection_commits: int
+    collection_batches: int
+
+
+# ---------------------------------------------------------------------------
+# Collection API models (full-text warehouse ingestion)
+# ---------------------------------------------------------------------------
+
+
+class CollectionWord(BaseModel):
+    """One ordered OCR word of a collected article, with its image box."""
+
+    seq: int
+    page_id: str
+    block_no: int
+    word_no: int
+    text: str
+    bbox: BBox
+
+
+class CollectionGroup(BaseModel):
+    """A collectable unit: every article touched by one catalog/OCR commit.
+
+    Groups are never split across pages.  ``commit_seq`` is the commit order
+    (1, 2, 3, ...); a full-load group uses a virtual commit ``0``.
+    """
+
+    commit_seq: int
+    articles: list[dict[str, Any]] = Field(
+        description=(
+            "Articles participating in one commit, ordered by article_id. "
+            "Each item contains article_id, title, revision and words."
+        )
+    )
+
+
+class BatchPageResponse(BaseModel):
+    batch_id: str
+    mode: str = Field(description="full (first load) or incremental (corrections)")
+    page: int
+    page_size: int
+    total_groups: int
+    total_pages: int
+    group_count: int
+    groups: list[dict[str, Any]]
+    next_page: int | None
+    is_final_page: bool
+    continuation: str | None = Field(
+        default=None,
+        description=(
+            "Opaque position token. Present on the final page; hand it to the "
+            "next incremental batch to read only corrections committed afterwards."
+        ),
+    )
+    anchor_commit_seq: int
+
+
+class BatchInfo(BaseModel):
+    batch_id: str
+    mode: str
+    page_size: int
+    anchor_commit_seq: int
+    after_commit_seq: int | None
+    total_groups: int
+    total_pages: int
+    created_at: str
+    continuation: str | None
+
+
+class BatchSummary(BaseModel):
+    batch_id: str
+    mode: str
+    page_size: int
+    anchor_commit_seq: int
+    after_commit_seq: int | None
+    total_groups: int
+    total_pages: int
+    created_at: str
+    continuation: str | None
+
+
+class BatchListResponse(BaseModel):
+    count: int
+    limit: int
+    batches: list[BatchSummary]
